@@ -6,7 +6,6 @@ import base64
 import os
 import re
 import datetime
-import concurrent.futures
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -24,7 +23,7 @@ JSON_KEY_PRODUCT = "product"
 JSON_KEY_CLIENT = "client"
 JSON_KEY_DRIVER = "driver"
 JSON_KEY_WEIGHT = "net"       # Net weight
-JSON_KEY_DENSITY = "density"  # NEW: Density for m3 calculation
+JSON_KEY_DENSITY = "density"  # Density
 JSON_KEY_PRICE = "price"
 JSON_KEY_DATE = "date_out"    
 
@@ -69,11 +68,11 @@ TRANSLATIONS = {
         "loading": "Chargement...",
         "total_rev": "Total Prix",
         "total_weight": "Poids Total",
-        "total_vol": "Volume Total", # NEW
+        "total_vol": "Volume Total",
         "count": "Nbr Opérations",
         "curr": "DH",
         "weight_unit": "kg",
-        "vol_unit": "m³" # NEW
+        "vol_unit": "m³"
     },
     "EN": {
         "title": "Operations Dashboard",
@@ -97,11 +96,11 @@ TRANSLATIONS = {
         "loading": "Loading...",
         "total_rev": "Total Price",
         "total_weight": "Total Weight",
-        "total_vol": "Total Volume", # NEW
+        "total_vol": "Total Volume",
         "count": "Total Ops",
         "curr": "MAD",
         "weight_unit": "kg",
-        "vol_unit": "m³" # NEW
+        "vol_unit": "m³"
     },
     "AR": {
         "title": "لوحة قيادة العمليات",
@@ -125,11 +124,11 @@ TRANSLATIONS = {
         "loading": "جار التحميل...",
         "total_rev": "إجمالي السعر",
         "total_weight": "إجمالي الوزن",
-        "total_vol": "إجمالي الحجم", # NEW
+        "total_vol": "إجمالي الحجم",
         "count": "عدد العمليات",
         "curr": "درهم",
         "weight_unit": "كغ",
-        "vol_unit": "م³" # NEW
+        "vol_unit": "م³"
     }
 }
 
@@ -154,7 +153,7 @@ def normalize_filename(name):
 
 @st.cache_data(ttl=600) 
 def load_data_and_map_files(_service, folder_id):
-    # 1. List ALL files once (Fast Metadata fetch)
+    # 1. List ALL files
     query = f"'{folder_id}' in parents and trashed=false"
     results = _service.files().list(
         q=query, 
@@ -163,14 +162,14 @@ def load_data_and_map_files(_service, folder_id):
     ).execute()
     files = results.get('files', [])
     
-    # 2. Separate JSONs and PDFs
+    # 2. Filter files
     json_files = [f for f in files if 'json' in f['name'].lower()]
     pdf_map = {normalize_filename(f['name']): f['id'] for f in files if 'pdf' in f['name'].lower()}
 
     all_records = []
 
-    # 3. Helper function to download ONE file (will be run in parallel)
-    def download_single_json(file_meta):
+    # 3. Sequential Download (Safe Mode)
+    for file_meta in json_files:
         try:
             request = _service.files().get_media(fileId=file_meta['id'])
             fh = io.BytesIO()
@@ -180,12 +179,11 @@ def load_data_and_map_files(_service, folder_id):
             fh.seek(0)
             
             content = fh.read().decode('utf-8')
-            if not content: return None
+            if not content: continue
             
             data = json.loads(content)
             items = data if isinstance(data, list) else [data]
             
-            processed_items = []
             for item in items:
                 # Add Metadata
                 item['_json_filename'] = file_meta['name']
@@ -197,23 +195,14 @@ def load_data_and_map_files(_service, folder_id):
                     JSON_KEY_PLATE, JSON_KEY_PRODUCT, JSON_KEY_CLIENT, 
                     JSON_KEY_DRIVER, JSON_KEY_WEIGHT, JSON_KEY_PRICE, 
                     JSON_KEY_DATE, JSON_KEY_1, JSON_KEY_2, JSON_KEY_3,
-                    JSON_KEY_DENSITY # Ensure density key exists
+                    JSON_KEY_DENSITY
                 ]
                 for k in keys_to_check:
                     if k not in item: item[k] = ""
                 
-                processed_items.append(item)
-            return processed_items
-        except Exception as e:
-            return None
-
-    # 4. RUN IN PARALLEL
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(download_single_json, f) for f in json_files]
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                all_records.extend(result)
+                all_records.append(item)
+        except:
+            continue
             
     # 5. Build DataFrame & Clean Data
     df = pd.DataFrame(all_records)
@@ -240,14 +229,12 @@ def load_data_and_map_files(_service, folder_id):
         ).fillna(0)
 
         # 4. Clean Density & Calculate Volume
-        # Volume (m3) = Weight (kg) / Density (kg/m3)
         if JSON_KEY_DENSITY in df.columns:
             df['clean_density'] = pd.to_numeric(
                 df[JSON_KEY_DENSITY].astype(str).str.replace(r'[^\d.]', '', regex=True), 
                 errors='coerce'
             ).fillna(0)
             
-            # Avoid division by zero
             df['clean_volume'] = df.apply(
                 lambda row: row['clean_weight'] / row['clean_density'] if row['clean_density'] > 0 else 0, 
                 axis=1
@@ -407,14 +394,12 @@ def main():
         total_ops = len(filtered_df)
         total_rev = filtered_df['clean_price'].sum()
         total_w = filtered_df['clean_weight'].sum()
-        total_vol = filtered_df['clean_volume'].sum() # Calculate Total Volume
+        total_vol = filtered_df['clean_volume'].sum()
         
-        # Display 4 Metrics now
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(L["count"], total_ops)
         m2.metric(L["total_rev"], f"{total_rev:,.2f} {L['curr']}")
         m3.metric(L["total_weight"], f"{total_w:,.2f} {L['weight_unit']}")
-        # NEW METRIC
         m4.metric(L["total_vol"], f"{total_vol:,.2f} {L['vol_unit']}")
         
         st.divider()
