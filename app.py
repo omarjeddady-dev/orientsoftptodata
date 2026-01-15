@@ -6,6 +6,7 @@ import base64
 import os
 import re
 import datetime
+import concurrent.futures
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -17,30 +18,25 @@ WEBSITE_URL = "https://www.orientscale.ma"
 PHONE_NUMBER = "0661572700"
 LOGO_PATH = "logo.png"
 
-# --- 🛠️ JSON KEY MAPPING (BASED ON YOUR SCREENSHOT) 🛠️ ---
-# These are the EXACT keys seen in your JSON file. Do not change these unless the JSON changes.
+# --- 🛠️ JSON KEY MAPPING 🛠️ ---
 JSON_KEY_PLATE = "plate"
 JSON_KEY_PRODUCT = "product"
 JSON_KEY_CLIENT = "client"
 JSON_KEY_DRIVER = "driver"
-JSON_KEY_WEIGHT = "net"      # Using 'net' weight as standard
+JSON_KEY_WEIGHT = "net"       # Net weight
+JSON_KEY_DENSITY = "density"  # NEW: Density for m3 calculation
 JSON_KEY_PRICE = "price"
-JSON_KEY_DATE = "date_out"   # Using date_out as the transaction time
+JSON_KEY_DATE = "date_out"    
 
 # --- 🛠️ CUSTOM FIELDS CONFIGURATION 🛠️ ---
-# Map the JSON keys (ex1, ex2, ex3) to Human Readable Names (Destination, Source, etc.)
+UI_NAME_1 = "Destination"    
+JSON_KEY_1 = "ex1"           
 
-# Field 1
-UI_NAME_1 = "Destination"    # What the user sees in the Dashboard
-JSON_KEY_1 = "ex1"           # The key in the JSON file
+UI_NAME_2 = "Source"         
+JSON_KEY_2 = "ex2"           
 
-# Field 2
-UI_NAME_2 = "Source"         # What the user sees
-JSON_KEY_2 = "ex2"           # The key in the JSON file
-
-# Field 3
-UI_NAME_3 = "Remorque"       # What the user sees
-JSON_KEY_3 = "ex3"           # The key in the JSON file
+UI_NAME_3 = "Remorque"       
+JSON_KEY_3 = "ex3"           
 
 # Drive Config
 FOLDER_ID = "115OinwLcQMYZ2l50qMEACnCt-9pXiy1o"
@@ -73,9 +69,11 @@ TRANSLATIONS = {
         "loading": "Chargement...",
         "total_rev": "Total Prix",
         "total_weight": "Poids Total",
+        "total_vol": "Volume Total", # NEW
         "count": "Nbr Opérations",
         "curr": "DH",
-        "weight_unit": "kg"
+        "weight_unit": "kg",
+        "vol_unit": "m³" # NEW
     },
     "EN": {
         "title": "Operations Dashboard",
@@ -99,9 +97,11 @@ TRANSLATIONS = {
         "loading": "Loading...",
         "total_rev": "Total Price",
         "total_weight": "Total Weight",
+        "total_vol": "Total Volume", # NEW
         "count": "Total Ops",
         "curr": "MAD",
-        "weight_unit": "kg"
+        "weight_unit": "kg",
+        "vol_unit": "m³" # NEW
     },
     "AR": {
         "title": "لوحة قيادة العمليات",
@@ -125,9 +125,11 @@ TRANSLATIONS = {
         "loading": "جار التحميل...",
         "total_rev": "إجمالي السعر",
         "total_weight": "إجمالي الوزن",
+        "total_vol": "إجمالي الحجم", # NEW
         "count": "عدد العمليات",
         "curr": "درهم",
-        "weight_unit": "كغ"
+        "weight_unit": "كغ",
+        "vol_unit": "م³" # NEW
     }
 }
 
@@ -139,7 +141,7 @@ def get_drive_service():
         creds = service_account.Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
     elif 'gcp_service_account' in st.secrets:
         creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)   
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)    
     if not creds:
         st.error("❌ Credentials not found.")
         st.stop()
@@ -152,18 +154,25 @@ def normalize_filename(name):
 
 @st.cache_data(ttl=600) 
 def load_data_and_map_files(_service, folder_id):
+    # 1. List ALL files once (Fast Metadata fetch)
     query = f"'{folder_id}' in parents and trashed=false"
-    results = _service.files().list(q=query, fields="files(id, name)").execute()
+    results = _service.files().list(
+        q=query, 
+        fields="files(id, name, createdTime)", 
+        pageSize=1000 
+    ).execute()
     files = results.get('files', [])
     
+    # 2. Separate JSONs and PDFs
     json_files = [f for f in files if 'json' in f['name'].lower()]
     pdf_map = {normalize_filename(f['name']): f['id'] for f in files if 'pdf' in f['name'].lower()}
 
     all_records = []
-    
-    for file in json_files:
+
+    # 3. Helper function to download ONE file (will be run in parallel)
+    def download_single_json(file_meta):
         try:
-            request = _service.files().get_media(fileId=file['id'])
+            request = _service.files().get_media(fileId=file_meta['id'])
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, request)
             done = False
@@ -171,38 +180,47 @@ def load_data_and_map_files(_service, folder_id):
             fh.seek(0)
             
             content = fh.read().decode('utf-8')
-            if not content: continue
+            if not content: return None
             
             data = json.loads(content)
             items = data if isinstance(data, list) else [data]
             
+            processed_items = []
             for item in items:
                 # Add Metadata
-                item['_json_filename'] = file['name']
-                norm_name = normalize_filename(file['name'])
+                item['_json_filename'] = file_meta['name']
+                norm_name = normalize_filename(file_meta['name'])
                 item['_pdf_file_id'] = pdf_map.get(norm_name)
                 
-                # --- FILL MISSING KEYS TO PREVENT ERRORS ---
-                # This ensures even if a JSON is old, it has the keys we expect
+                # Fill missing keys default
                 keys_to_check = [
                     JSON_KEY_PLATE, JSON_KEY_PRODUCT, JSON_KEY_CLIENT, 
                     JSON_KEY_DRIVER, JSON_KEY_WEIGHT, JSON_KEY_PRICE, 
-                    JSON_KEY_DATE, JSON_KEY_1, JSON_KEY_2, JSON_KEY_3
+                    JSON_KEY_DATE, JSON_KEY_1, JSON_KEY_2, JSON_KEY_3,
+                    JSON_KEY_DENSITY # Ensure density key exists
                 ]
                 for k in keys_to_check:
-                    if k not in item:
-                        item[k] = ""
-                        
-                all_records.append(item)
-        except:
-            pass
+                    if k not in item: item[k] = ""
+                
+                processed_items.append(item)
+            return processed_items
+        except Exception as e:
+            return None
+
+    # 4. RUN IN PARALLEL
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(download_single_json, f) for f in json_files]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                all_records.extend(result)
             
+    # 5. Build DataFrame & Clean Data
     df = pd.DataFrame(all_records)
     
     if not df.empty:
-        # 1. Clean Date (Using the key from your screenshot)
+        # 1. Clean Date
         df['clean_date'] = pd.to_datetime(df[JSON_KEY_DATE], errors='coerce')
-        # If date_out is empty, try date_in, else now
         if 'date_in' in df.columns:
             df['clean_date'] = df['clean_date'].fillna(pd.to_datetime(df['date_in'], errors='coerce'))
         df['clean_date'] = df['clean_date'].fillna(pd.to_datetime(datetime.datetime.now()))
@@ -221,7 +239,24 @@ def load_data_and_map_files(_service, folder_id):
             errors='coerce'
         ).fillna(0)
 
-        # 4. Standardize Strings for Filters
+        # 4. Clean Density & Calculate Volume
+        # Volume (m3) = Weight (kg) / Density (kg/m3)
+        if JSON_KEY_DENSITY in df.columns:
+            df['clean_density'] = pd.to_numeric(
+                df[JSON_KEY_DENSITY].astype(str).str.replace(r'[^\d.]', '', regex=True), 
+                errors='coerce'
+            ).fillna(0)
+            
+            # Avoid division by zero
+            df['clean_volume'] = df.apply(
+                lambda row: row['clean_weight'] / row['clean_density'] if row['clean_density'] > 0 else 0, 
+                axis=1
+            )
+        else:
+            df['clean_density'] = 0
+            df['clean_volume'] = 0
+
+        # 5. Standardize Strings
         df['Main_Product'] = df[JSON_KEY_PRODUCT].astype(str)
         df['Vehicle_Ref'] = df[JSON_KEY_PLATE].astype(str)
         df['Client_Ref'] = df[JSON_KEY_CLIENT].astype(str)
@@ -294,22 +329,16 @@ def main():
         search_term = c2.text_input(L["global_search"], placeholder="...")
 
         c3, c4, c5, c6 = st.columns(4)
-        # 1. Clients
         sel_clients = c3.multiselect(L["clients"], raw_df['Client_Ref'].unique())
-        # 2. Vehicles (Mapped correctly to 'plate')
         sel_vehs = c4.multiselect(L["vehicles"], raw_df['Vehicle_Ref'].unique())
-        # 3. Products
         sel_prods = c5.multiselect(L["products"], raw_df['Main_Product'].unique())
-        # 4. Drivers
         sel_drivers = c6.multiselect(L["drivers"], raw_df['Driver_Ref'].unique())
 
-        # Custom Fields (Mapped to ex1, ex2, ex3)
         custom_filters = {}
         if UI_NAME_1 or UI_NAME_2 or UI_NAME_3:
             st.markdown("---") 
             cc1, cc2, cc3 = st.columns(3)
             if UI_NAME_1 and JSON_KEY_1 in raw_df.columns:
-                # Get unique values that are not empty
                 vals = [x for x in raw_df[JSON_KEY_1].astype(str).unique() if x and x != "nan"]
                 custom_filters[JSON_KEY_1] = cc1.multiselect(f"{UI_NAME_1}", vals)
             
@@ -324,21 +353,17 @@ def main():
     # --- APPLY FILTERS ---
     filtered_df = raw_df.copy()
     
-    # Date
     if len(date_range) == 2:
         filtered_df = filtered_df[(filtered_df['clean_date'].dt.date >= date_range[0]) & (filtered_df['clean_date'].dt.date <= date_range[1])]
     
-    # Main Dropdowns
     if sel_clients: filtered_df = filtered_df[filtered_df['Client_Ref'].isin(sel_clients)]
     if sel_vehs: filtered_df = filtered_df[filtered_df['Vehicle_Ref'].isin(sel_vehs)]
     if sel_prods: filtered_df = filtered_df[filtered_df['Main_Product'].isin(sel_prods)]
     if sel_drivers: filtered_df = filtered_df[filtered_df['Driver_Ref'].isin(sel_drivers)]
     
-    # Custom Dropdowns
     for key, val in custom_filters.items():
         if val: filtered_df = filtered_df[filtered_df[key].astype(str).isin(val)]
 
-    # Search
     if search_term:
         mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_term, case=False)).any(axis=1)
         filtered_df = filtered_df[mask]
@@ -352,10 +377,7 @@ def main():
         with col_list:
             st.markdown(f"### {L['tickets_found']}: {len(filtered_df)}")
             
-            # Prepare clean display columns
-            # We want to show the raw columns from JSON + the Custom names
-            # Hide internal calculations
-            cols_to_hide = ['clean_date', 'clean_price', 'clean_weight', 'Hour', 'Main_Product', 'Driver_Ref', 'Client_Ref', 'Vehicle_Ref', '_json_filename', '_pdf_file_id']
+            cols_to_hide = ['clean_date', 'clean_price', 'clean_weight', 'clean_density', 'clean_volume', 'Hour', 'Main_Product', 'Driver_Ref', 'Client_Ref', 'Vehicle_Ref', '_json_filename', '_pdf_file_id']
             display_cols = [c for c in filtered_df.columns if not c.startswith('_') and c not in cols_to_hide]
             
             event = st.dataframe(filtered_df[display_cols], use_container_width=True, on_select="rerun", selection_mode="single-row", hide_index=True, height=600)
@@ -366,7 +388,6 @@ def main():
                 sel_row = filtered_df.iloc[event.selection.rows[0]]
                 pdf_id = sel_row.get('_pdf_file_id')
                 
-                # Show Ticket Details above PDF
                 st.info(f"Ticket: {sel_row.get('ticket_no', 'N/A')} | {sel_row.get('plate', 'N/A')}")
                 
                 if pdf_id:
@@ -386,11 +407,16 @@ def main():
         total_ops = len(filtered_df)
         total_rev = filtered_df['clean_price'].sum()
         total_w = filtered_df['clean_weight'].sum()
+        total_vol = filtered_df['clean_volume'].sum() # Calculate Total Volume
         
-        m1, m2, m3 = st.columns(3)
+        # Display 4 Metrics now
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric(L["count"], total_ops)
         m2.metric(L["total_rev"], f"{total_rev:,.2f} {L['curr']}")
         m3.metric(L["total_weight"], f"{total_w:,.2f} {L['weight_unit']}")
+        # NEW METRIC
+        m4.metric(L["total_vol"], f"{total_vol:,.2f} {L['vol_unit']}")
+        
         st.divider()
         
         c1, c2 = st.columns(2)
@@ -413,7 +439,6 @@ def main():
             output = io.BytesIO()
             try:
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    # Export raw visible columns
                     filtered_df.drop(columns=[c for c in filtered_df.columns if c.startswith('_')]).to_excel(writer, index=False)
             except:
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
