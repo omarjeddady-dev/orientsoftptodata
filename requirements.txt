@@ -1,8 +1,10 @@
 streamlit
-pandas
+pandas<2.2.0
 google-auth
 google-auth-oauthlib
 google-api-python-client
 plotly
 xlsxwriter
 openpyxl
+numpy<2.0.0
+pyarrow<15.0.0
