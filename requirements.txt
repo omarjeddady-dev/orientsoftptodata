@@ -1,8 +1,8 @@
 streamlit
 pandas
-google-api-python-client
-google-auth-httplib2
+google-auth
 google-auth-oauthlib
-openpyxl
-xlsxwriter
+google-api-python-client
 plotly
+xlsxwriter
+openpyxl
